@@ -151,7 +151,7 @@ class FaceRecognitionSystem:
             print("\nEnrollment cancelled or incomplete.")
             
     def train_model(self):
-        """Train a deep learning model for face recognition"""
+        """Train a deep learning model for face recognition using MobileNetV2"""
         if not self.enrolled_students:
             print("No enrolled students found. Please enroll students first.")
             return
@@ -161,28 +161,35 @@ class FaceRecognitionSystem:
         # Prepare training data from enrolled students
         X_enrolled = []
         y_enrolled = []
-        class_names = list(self.enrolled_students.keys())
+        self.class_names = list(self.enrolled_students.keys())
+        num_classes = len(self.class_names)
         
-        print(f"Preparing training data for {len(class_names)} enrolled students...")
+        print(f"Preparing training data for {num_classes} enrolled students...")
         
         for idx, (name, faces) in enumerate(self.enrolled_students.items()):
             print(f"Processing {name} with {len(faces)} face samples")
             for face in faces:
                 # Add original face
                 X_enrolled.append(face)
-                y_enrolled.append(1)
+                y_enrolled.append(idx)  # Use index as class label
                 
                 # Add horizontally flipped face
                 X_enrolled.append(cv2.flip(face, 1))
-                y_enrolled.append(1)
+                y_enrolled.append(idx)
                 
                 # Add slightly rotated faces
-                for angle in [-15, 15]:
+                for angle in [-15, -10, -5, 5, 10, 15]:
                     rows, cols = face.shape[:2]
                     M = cv2.getRotationMatrix2D((cols/2, rows/2), angle, 1)
                     rotated = cv2.warpAffine(face, M, (cols, rows))
                     X_enrolled.append(rotated)
-                    y_enrolled.append(1)
+                    y_enrolled.append(idx)
+                
+                # Add brightness variations
+                for alpha in [0.8, 1.2]:  # brightness factor
+                    brightened = cv2.convertScaleAbs(face, alpha=alpha, beta=0)
+                    X_enrolled.append(brightened)
+                    y_enrolled.append(idx)
                 
         X_enrolled = np.array(X_enrolled)
         y_enrolled = np.array(y_enrolled)
@@ -213,7 +220,19 @@ class FaceRecognitionSystem:
                         img_array = img_to_array(img)
                         img_array = img_array / 255.0
                         X_dataset.append(img_array)
-                        y_dataset.append(0)
+                        y_dataset.append(num_classes)  # Use num_classes as the "unknown" class
+                        
+                        # Add augmented negative samples
+                        X_dataset.append(cv2.flip(img_array, 1))
+                        y_dataset.append(num_classes)
+                        
+                        for angle in [-15, 15]:
+                            rows, cols = img_array.shape[:2]
+                            M = cv2.getRotationMatrix2D((cols/2, rows/2), angle, 1)
+                            rotated = cv2.warpAffine(img_array, M, (cols, rows))
+                            X_dataset.append(rotated)
+                            y_dataset.append(num_classes)
+                            
                     except Exception as e:
                         print(f"Error processing {image_name}: {e}")
             
@@ -225,123 +244,73 @@ class FaceRecognitionSystem:
             X = np.concatenate([X_enrolled, X_dataset])
             y = np.concatenate([y_enrolled, y_dataset])
             
+            # Convert labels to one-hot encoding
+            y = tf.keras.utils.to_categorical(y, num_classes=num_classes + 1)
+            
             # Shuffle the data
             indices = np.arange(len(X))
             np.random.shuffle(indices)
             X = X[indices]
             y = y[indices]
             
-            # Create a simple CNN model
+            # Split into training and validation sets
+            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # Create base model using MobileNetV2
+            base_model = MobileNetV2(
+                weights='imagenet',
+                include_top=False,
+                input_shape=(self.image_size[0], self.image_size[1], 3)
+            )
+            
+            # Freeze the base model layers
+            base_model.trainable = False
+            
+            # Create the model
             model = models.Sequential([
-                # First convolutional block
-                layers.Conv2D(32, (3, 3), activation='relu', input_shape=(self.image_size[0], self.image_size[1], 3)),
+                base_model,
+                layers.GlobalAveragePooling2D(),
+                layers.Dropout(0.2),
+                layers.Dense(512, activation='relu'),
                 layers.BatchNormalization(),
-                layers.MaxPooling2D((2, 2)),
-                
-                # Second convolutional block
-                layers.Conv2D(64, (3, 3), activation='relu'),
-                layers.BatchNormalization(),
-                layers.MaxPooling2D((2, 2)),
-                
-                # Third convolutional block
-                layers.Conv2D(64, (3, 3), activation='relu'),
-                layers.BatchNormalization(),
-                layers.MaxPooling2D((2, 2)),
-                
-                # Dense layers
-                layers.Flatten(),
-                layers.Dense(128, activation='relu'),
-                layers.BatchNormalization(),
-                layers.Dropout(0.5),
-                layers.Dense(1, activation='sigmoid')
+                layers.Dropout(0.2),
+                layers.Dense(num_classes + 1, activation='softmax')  # +1 for unknown class
             ])
             
-            # Compile with binary crossentropy
+            # Compile the model
             model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                loss='binary_crossentropy',
+                optimizer='adam',
+                loss='categorical_crossentropy',
                 metrics=['accuracy']
             )
             
-            # Split the data
-            X_train, X_val, y_train, y_val = train_test_split(
-                X, y, test_size=0.2, random_state=42, stratify=y
-            )
-            
-            print(f"\nTraining samples: {len(X_train)}, Validation samples: {len(X_val)}")
-            print(f"Positive samples in training: {np.sum(y_train == 1)}")
-            print(f"Negative samples in training: {np.sum(y_train == 0)}")
-            
             # Train the model
+            print("\nTraining the model...")
             history = model.fit(
                 X_train, y_train,
-                epochs=30,
-                batch_size=32,
                 validation_data=(X_val, y_val),
+                epochs=20,
+                batch_size=32,
                 callbacks=[
                     tf.keras.callbacks.EarlyStopping(
-                        monitor='val_accuracy',
-                        patience=5,
+                        monitor='val_loss',
+                        patience=3,
                         restore_best_weights=True
                     )
                 ]
             )
             
+            # Save the model
+            model.save(self.model_path)
+            self.face_recognition_model = model
+            
+            print("\nModel training completed!")
+            print(f"Final validation accuracy: {history.history['val_accuracy'][-1]:.2f}")
+            
         except Exception as e:
-            print(f"Error during training: {e}")
-            print("Falling back to simple model with enrolled data only...")
-            
-            # Create an even simpler model for the small dataset
-            model = models.Sequential([
-                layers.Conv2D(32, (3, 3), activation='relu', input_shape=(self.image_size[0], self.image_size[1], 3)),
-                layers.MaxPooling2D((2, 2)),
-                layers.Conv2D(32, (3, 3), activation='relu'),
-                layers.MaxPooling2D((2, 2)),
-                layers.Flatten(),
-                layers.Dense(64, activation='relu'),
-                layers.Dropout(0.5),
-                layers.Dense(1, activation='sigmoid')
-            ])
-            
-            model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-                loss='binary_crossentropy',
-                metrics=['accuracy']
-            )
-            
-            # Split enrolled data only
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_enrolled, y_enrolled, test_size=0.2, random_state=42
-            )
-            
-            # Train with enrolled data only
-            history = model.fit(
-                X_train, y_train,
-                epochs=20,
-                batch_size=8,
-                validation_data=(X_val, y_val)
-            )
-        
-        # Save the model
-        model.save(self.model_path.replace('.h5', '.keras'))
-        self.face_recognition_model = model
-        self.class_names = class_names
-        
-        # Print final accuracy
-        final_accuracy = history.history['accuracy'][-1]
-        final_val_accuracy = history.history['val_accuracy'][-1]
-        print(f"\nTraining completed with accuracy: {final_accuracy:.4f}, validation accuracy: {final_val_accuracy:.4f}")
-        
-        # Print class-wise accuracy
-        print("\nClass-wise accuracy:")
-        y_pred = model.predict(X_val)
-        y_pred_classes = (y_pred > 0.5).astype(int).flatten()
-        
-        for i, class_name in enumerate(class_names):
-            mask = y_val == 1  # For enrolled student
-            if np.sum(mask) > 0:
-                class_acc = np.mean(y_pred_classes[mask] == y_val[mask])
-                print(f"{class_name}: {class_acc:.4f}")
+            print(f"Error during model training: {e}")
+            import traceback
+            traceback.print_exc()
         
     def load_attendance_data(self):
         """Load existing attendance data"""
@@ -492,37 +461,42 @@ class FaceRecognitionSystem:
                     # Extract face ROI
                     face_roi = frame[y:y+h, x:x+w]
                     
-                    # Resize and preprocess for model
-                    face_roi = cv2.resize(face_roi, self.image_size)
-                    face_roi = face_roi / 255.0
-                    face_roi = np.expand_dims(face_roi, axis=0)
+                    # Preprocess face for recognition
+                    face_roi = self.preprocess_face(face_roi)
                     
                     # Get prediction
-                    prediction = self.face_recognition_model.predict(face_roi, verbose=0)[0][0]
+                    prediction = self.face_recognition_model.predict(face_roi, verbose=0)[0]
                     
                     # Draw rectangle around face
                     cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
                     
+                    # Get predicted class and confidence
+                    predicted_class = np.argmax(prediction)
+                    confidence = prediction[predicted_class] * 100
+                    
                     # Check if face is recognized with high confidence
-                    if prediction > 0.5:  # Threshold for recognition
-                        name = self.class_names[0]  # Since we're using binary classification
-                        confidence = prediction * 100
-                        
-                        # Draw name and confidence
-                        cv2.putText(frame, f"{name} ({confidence:.1f}%)", 
-                                  (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                        
-                        # Mark attendance if not already marked
-                        current_time = datetime.now()
-                        if name not in attendance_marked:
-                            self.mark_attendance(name)
-                            attendance_marked.add(name)
-                            last_attendance_time[name] = current_time
-                            print(f"Attendance marked for {name}")
-                        elif (current_time - last_attendance_time[name]).total_seconds() > 300:  # 5 minutes
-                            self.mark_attendance(name)
-                            last_attendance_time[name] = current_time
-                            print(f"Attendance marked for {name} (after 5 minutes)")
+                    if confidence > 70:  # Increased threshold for better accuracy
+                        if predicted_class < len(self.class_names):  # Check if it's a known student
+                            name = self.class_names[predicted_class]
+                            
+                            # Draw name and confidence
+                            cv2.putText(frame, f"{name} ({confidence:.1f}%)", 
+                                      (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                            
+                            # Mark attendance if not already marked
+                            current_time = datetime.now()
+                            if name not in attendance_marked:
+                                self.mark_attendance(name)
+                                attendance_marked.add(name)
+                                last_attendance_time[name] = current_time
+                                print(f"Attendance marked for {name}")
+                            elif (current_time - last_attendance_time[name]).total_seconds() > 300:  # 5 minutes
+                                self.mark_attendance(name)
+                                last_attendance_time[name] = current_time
+                                print(f"Attendance marked for {name} (after 5 minutes)")
+                        else:
+                            cv2.putText(frame, "Unknown", (x, y-10), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                     else:
                         cv2.putText(frame, "Unknown", (x, y-10), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
